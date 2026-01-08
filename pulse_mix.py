@@ -7,7 +7,6 @@ import argparse
 import base64
 import datetime as _dt
 import json
-import math
 import re
 import sys
 from pathlib import Path
@@ -248,11 +247,6 @@ def _parse_int_js(value: str, *, field: str) -> int:
     return int(match.group(1))
 
 
-def _js_round(value: float) -> int:
-    # JS Math.round: round half towards +∞ (can be modeled as floor(x + 0.5))
-    return int(math.floor(value + 0.5))
-
-
 def _normalize_pulse_text(raw: str) -> str:
     text = raw.strip()
     if text.startswith(DUNGEONLAB_PREFIX):
@@ -298,36 +292,146 @@ def _number_like_js(value: float) -> float | int:
     return value
 
 
+def _default_points_json_string() -> str:
+    return json.dumps(
+        [
+            {"anchor": 0, "x": 0, "y": 0.0},
+            {"anchor": 0, "x": 1, "y": 0.0},
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _evenly_sample(
+    points: list[tuple[int, float]], target: int
+) -> list[tuple[int, float]]:
+    if target <= 0:
+        return []
+    if len(points) <= target:
+        return points
+    if target == 1:
+        return [points[0]]
+
+    last_index = len(points) - 1
+    sampled: list[tuple[int, float]] = []
+    prev = -1
+    for i in range(target):
+        idx = round(i * last_index / (target - 1))
+        if idx <= prev:
+            idx = prev + 1
+        if idx > last_index:
+            idx = last_index
+        sampled.append(points[idx])
+        prev = idx
+        if prev == last_index:
+            break
+
+    if len(sampled) < target:
+        sampled.extend([points[-1]] * (target - len(sampled)))
+    return sampled
+
+
+def _ensure_min_points(
+    points: list[tuple[int, float]],
+    *,
+    minimum: int,
+) -> list[tuple[int, float]]:
+    if minimum <= 0:
+        return points
+    if not points:
+        return [(0, 0.0)] * minimum
+    if len(points) >= minimum:
+        return points
+    return points + [points[-1]] * (minimum - len(points))
+
+
+def _parse_points_json_string(
+    metadata_string: str,
+    *,
+    section_index: int,
+    max_points: int,
+    min_points: int,
+) -> tuple[int, str]:
+    if not metadata_string:
+        return 2, _default_points_json_string()
+
+    raw_segments = [seg for seg in metadata_string.split(",") if seg]
+    parsed: list[tuple[int, float]] = []
+    for idx, segment in enumerate(raw_segments):
+        if segment.count("-") != 1:
+            continue
+        intensity_raw, anchor_raw = segment.split("-", 1)
+        intensity = _parse_float_js(
+            intensity_raw, field=f"intensity{section_index}[{idx}]"
+        )
+        anchor = _parse_int_js(anchor_raw, field=f"anchor{section_index}[{idx}]")
+        y = (intensity / 100) * 20
+        if y < 0:
+            y = 0.0
+        elif y > 20:
+            y = 20.0
+        parsed.append((anchor, y))
+
+    if max_points > 0:
+        parsed = _evenly_sample(parsed, max_points)
+    parsed = _ensure_min_points(parsed, minimum=min_points)
+
+    points_json: list[dict[str, Any]] = []
+    for x, (anchor, y) in enumerate(parsed):
+        points_json.append({"anchor": anchor, "x": x, "y": y})
+
+    return len(points_json), json.dumps(
+        points_json, ensure_ascii=False, separators=(",", ":")
+    )
+
+
 def parse_dungeonlab_pulse(
     raw_pulse_text: str,
     *,
     name: str | None,
     max_sections: int = 3,
+    max_points_per_section: int = 30,
+    min_points_per_section: int = 2,
 ) -> dict[str, Any]:
     text = _normalize_pulse_text(raw_pulse_text)
     data_string = text[len(DUNGEONLAB_PREFIX) :]
 
-    result: dict[str, Any] = {
-        "classic": 1,
-        "defaultName": 0,
-        "waveName": name or "名称",
-        "waveNameEn": name or "Name",
-        "L": 0,
-        "ZY": 16,
-    }
+    wave_name = name or "名称"
+    wave_name_en = name or "Name"
+
+    l_value: float | int = 0
+    zy_value = 16
 
     if "=" in data_string:
         header, data_string = data_string.split("=", 1)
         header_values = header.split(",")
         if len(header_values) >= 3:
-            result["L"] = _number_like_js(_parse_float_js(header_values[0], field="L"))
-            result["ZY"] = _parse_int_js(header_values[2], field="ZY")
+            l_value = _number_like_js(_parse_float_js(header_values[0], field="L"))
+            zy_value = _parse_int_js(header_values[2], field="ZY")
+
+    section_count = 3
+    parse_limit = min(max_sections, section_count)
+
+    default_a = 0
+    default_b = 20
+    default_j = 0
+    default_pc = 1
+    default_points = _default_points_json_string()
+
+    a_values: list[float | int] = [default_a] * section_count
+    b_values: list[float | int] = [default_b] * section_count
+    j_values: list[int] = [default_j] * section_count
+    pc_values: list[int] = [default_pc] * section_count
+    c_values: list[int] = [2] * section_count
+    points_values: list[str] = [default_points] * section_count
+    jie_values: list[int] = [0] * section_count
 
     sections = data_string.split("+section+")
-    section_index = 0
+    parsed_sections = 0
 
     for section_data in sections:
-        if section_index >= max_sections:
+        if parsed_sections >= parse_limit:
             break
 
         if "/" not in section_data:
@@ -338,11 +442,13 @@ def parse_dungeonlab_pulse(
         if len(params) < 5:
             continue
 
-        frequency_a = _parse_float_js(params[0], field=f"A{section_index}")
-        frequency_b = _parse_float_js(params[1], field=f"B{section_index}")
-        duration_index = _parse_int_js(params[2], field=f"durationIndex{section_index}")
-        mode = _parse_int_js(params[3], field=f"PC{section_index}")
-        switch_value = _parse_int_js(params[4], field=f"JIE{section_index}")
+        frequency_a = _parse_float_js(params[0], field=f"A{parsed_sections}")
+        frequency_b = _parse_float_js(params[1], field=f"B{parsed_sections}")
+        duration_index = _parse_int_js(
+            params[2], field=f"durationIndex{parsed_sections}"
+        )
+        mode = _parse_int_js(params[3], field=f"PC{parsed_sections}")
+        switch_value = _parse_int_js(params[4], field=f"JIE{parsed_sections}")
 
         if 0 <= duration_index < len(SECTION_TIME_MAP):
             real_duration_value = SECTION_TIME_MAP[duration_index]
@@ -354,52 +460,96 @@ def parse_dungeonlab_pulse(
 
         closest_index = _closest_old_section_time_index(real_duration_value)
 
-        result[f"A{section_index}"] = _number_like_js(frequency_a)
-        result[f"B{section_index}"] = _number_like_js(frequency_b)
-        result[f"J{section_index}"] = closest_index
-        result[f"PC{section_index}"] = mode
-        if section_index > 0:
-            result[f"JIE{section_index}"] = switch_value
+        a_values[parsed_sections] = _number_like_js(frequency_a)
+        b_values[parsed_sections] = _number_like_js(frequency_b)
+        j_values[parsed_sections] = closest_index
+        pc_values[parsed_sections] = mode
+        if parsed_sections > 0:
+            jie_values[parsed_sections] = switch_value
 
-        if metadata_string:
-            pulses = metadata_string.split(",")
-            result[f"C{section_index}"] = len(pulses)
+        c_value, points_value = _parse_points_json_string(
+            metadata_string,
+            section_index=parsed_sections,
+            max_points=max_points_per_section,
+            min_points=min_points_per_section,
+        )
+        c_values[parsed_sections] = c_value
+        points_values[parsed_sections] = points_value
 
-            metadata_json: list[dict[str, Any]] = []
-            for idx, pulse_str in enumerate(pulses):
-                if pulse_str.count("-") != 1:
-                    continue
-                intensity_raw, anchor_type = pulse_str.split("-", 1)
-                intensity = _parse_float_js(
-                    intensity_raw, field=f"intensity{section_index}[{idx}]"
-                )
-                mapped_intensity = _js_round((intensity / 100) * 20)
-                metadata_json.append(
-                    {
-                        "anchor": anchor_type,
-                        "x": idx,
-                        "y": mapped_intensity,
-                    }
-                )
+        parsed_sections += 1
 
-            result[f"points{section_index + 1}"] = json.dumps(
-                metadata_json, ensure_ascii=False, separators=(",", ":")
-            )
-        else:
-            result[f"C{section_index}"] = 0
-            result[f"points{section_index + 1}"] = "[]"
+    ordered: dict[str, Any] = {}
+    for i in range(section_count):
+        ordered[f"A{i}"] = a_values[i]
+    for i in range(section_count):
+        ordered[f"B{i}"] = b_values[i]
+    for i in range(section_count):
+        ordered[f"C{i}"] = c_values[i]
+    for i in range(section_count):
+        ordered[f"J{i}"] = j_values[i]
+    if section_count >= 2:
+        ordered["JIE1"] = jie_values[1]
+    if section_count >= 3:
+        ordered["JIE2"] = jie_values[2]
 
-        section_index += 1
+    ordered["L"] = l_value
+    for i in range(section_count):
+        ordered[f"PC{i}"] = pc_values[i]
+    ordered["ZY"] = zy_value
+    ordered["classic"] = 1
+    ordered["defaultName"] = 0
+    for i in range(section_count):
+        ordered[f"points{i + 1}"] = points_values[i]
+    ordered["waveName"] = wave_name
+    ordered["waveNameEn"] = wave_name_en
 
-    return result
+    return ordered
 
 
 def _timestamp_utc_yyyymmddhhmmss() -> str:
-    return _dt.datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%d%H%M%S")
 
 
 def _default_output_filename() -> str:
     return f"波形聚合-{_timestamp_utc_yyyymmddhhmmss()}.txt"
+
+
+def _output_paths_for_chunks(
+    *,
+    output: str | None,
+    chunk_count: int,
+) -> list[Path]:
+    if chunk_count <= 0:
+        raise ValueError("chunk_count must be > 0")
+
+    if output is None:
+        base = Path(_default_output_filename())
+        stem = base.stem
+        suffix = base.suffix or ".txt"
+        if chunk_count == 1:
+            return [base]
+        return [Path(f"{stem}-{i:03d}{suffix}") for i in range(1, chunk_count + 1)]
+
+    output_path = Path(output)
+    if output_path.exists() and output_path.is_dir():
+        output_dir = output_path
+        output_dir.mkdir(parents=True, exist_ok=True)
+        base = Path(_default_output_filename())
+        stem = base.stem
+        suffix = base.suffix or ".txt"
+        if chunk_count == 1:
+            return [output_dir / f"{stem}{suffix}"]
+        return [
+            output_dir / f"{stem}-{i:03d}{suffix}" for i in range(1, chunk_count + 1)
+        ]
+
+    if chunk_count == 1:
+        return [output_path]
+
+    suffix = output_path.suffix or ".txt"
+    stem = output_path.stem if output_path.suffix else output_path.name
+    parent = output_path.parent if output_path.parent != Path("") else Path(".")
+    return [parent / f"{stem}-{i:03d}{suffix}" for i in range(1, chunk_count + 1)]
 
 
 def _iter_pulse_files(paths: list[Path], *, recursive: bool) -> list[Path]:
@@ -443,7 +593,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument(
         "-o",
         "--output",
-        help="输出 .txt 路径（默认：波形聚合-<UTC时间戳>.txt）",
+        help="输出 .txt 路径或目录（默认：波形聚合-<UTC时间戳>.txt）",
     )
     parser.add_argument(
         "-r",
@@ -460,7 +610,19 @@ def main(argv: list[str]) -> int:
         "--max-sections",
         type=int,
         default=3,
-        help="每条波形最多保留的小节数（默认：3，与网页一致）",
+        help="读取每条波形最多的小节数（默认：3；导出结构固定为 3 小节）",
+    )
+    parser.add_argument(
+        "--max-points-per-section",
+        type=int,
+        default=30,
+        help="每小节最多点数（默认：30；>0 时会降采样到该数量，0 表示不限制）",
+    )
+    parser.add_argument(
+        "--min-points-per-section",
+        type=int,
+        default=2,
+        help="每小节最少点数（默认：2；不足会用末点补齐）",
     )
     parser.add_argument(
         "--name-mode",
@@ -478,8 +640,20 @@ def main(argv: list[str]) -> int:
         action="store_true",
         help="输出格式化 JSON（默认：压缩一行，与网页一致）",
     )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=200,
+        help="切片输出：每个 .txt 最多包含的波形数量（默认：200；<=0 表示不切片）",
+    )
 
     args = parser.parse_args(argv)
+
+    output_arg = args.output
+    if output_arg is None:
+        output_dir = Path(__file__).resolve().parent / "output"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_arg = str(output_dir)
 
     input_args = args.inputs if args.inputs else ["pulse"]
     input_paths = [Path(p).expanduser() for p in input_args]
@@ -491,10 +665,6 @@ def main(argv: list[str]) -> int:
     if not pulse_files:
         raise SystemExit("未找到任何 .pulse 文件")
 
-    output_path = Path(args.output) if args.output else Path(_default_output_filename())
-    if output_path.exists() and output_path.is_dir():
-        output_path = output_path / _default_output_filename()
-
     waves: list[dict[str, Any]] = []
     errors: list[str] = []
 
@@ -503,7 +673,11 @@ def main(argv: list[str]) -> int:
             raw_text = _read_text(pulse_path, encoding=args.encoding)
             name = _name_from_path(pulse_path, mode=args.name_mode)
             wave = parse_dungeonlab_pulse(
-                raw_text, name=name, max_sections=args.max_sections
+                raw_text,
+                name=name,
+                max_sections=args.max_sections,
+                max_points_per_section=args.max_points_per_section,
+                min_points_per_section=args.min_points_per_section,
             )
             waves.append(wave)
         except Exception as exc:
@@ -513,14 +687,32 @@ def main(argv: list[str]) -> int:
                 continue
             raise SystemExit(message) from exc
 
-    if args.pretty:
-        json_text = json.dumps(waves, ensure_ascii=False, indent=2)
+    chunk_size = args.chunk_size
+    if chunk_size is None or chunk_size <= 0:
+        chunks = [waves]
     else:
-        json_text = json.dumps(waves, ensure_ascii=False, separators=(",", ":"))
+        chunks = [waves[i : i + chunk_size] for i in range(0, len(waves), chunk_size)]
 
-    output_path.write_text(json_text + "\n", encoding="utf-8")
+    output_paths = _output_paths_for_chunks(
+        output=output_arg,
+        chunk_count=len(chunks),
+    )
 
-    print(f"已导出 {len(waves)} 条波形到: {output_path}")
+    for chunk, out_path in zip(chunks, output_paths, strict=True):
+        if args.pretty:
+            json_text = json.dumps(chunk, ensure_ascii=False, indent=2)
+        else:
+            json_text = json.dumps(chunk, ensure_ascii=False, separators=(",", ":"))
+        out_path.write_text(json_text, encoding="utf-8")
+
+    if len(output_paths) == 1:
+        print(f"已导出 {len(waves)} 条波形到: {output_paths[0]}")
+    else:
+        print(
+            f"已导出 {len(waves)} 条波形到 {len(output_paths)} 个文件（每个最多 {chunk_size} 条）："
+        )
+        for out_path in output_paths:
+            print(f"- {out_path}")
     if errors:
         print(f"跳过 {len(errors)} 个文件（--skip-invalid）:", file=sys.stderr)
         for line in errors:
